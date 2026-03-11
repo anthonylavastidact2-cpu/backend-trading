@@ -1,182 +1,68 @@
-# main.py
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
-import ta
-from ta.volatility import AverageTrueRange
-from ta.trend import EMAIndicator
-from ta.momentum import RSIIndicator
-import requests
-import asyncio
-import telegram
-import os
-import threading
-import time
+from investiny import historical_data, search_assets
 
-# ===================== CONFIGURACIÓN =====================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "poner_aqui_tu_token")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "poner_aqui_tu_chat_id")
-TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "poner_aqui_tu_api_key")
-
-app = FastAPI()
-
-# Permitir que tu página web (GitHub Pages) llame a esta API
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # En producción, pondrías la URL de tu GitHub Pages
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ===================== FUNCIONES DE ESTRATEGIAS =====================
-def calcular_indicadores(df):
-    if df is None or len(df) < 20:
-        return None
-    df = df.copy()
-    df.columns = [c.lower() for c in df.columns]
-    df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
-    df['ema_20'] = EMAIndicator(df['close'], window=20).ema_indicator()
-    atr = AverageTrueRange(df['high'], df['low'], df['close'], window=14)
-    df['atr'] = atr.average_true_range()
-    df['atr_pct'] = (df['atr'] / df['close']) * 100
-    return df
-
-def detectar_senal_apalancamiento(df):
-    if df is None:
-        return None
-    ultimo = df.iloc[-1]
-    # Señal de COMPRA
-    if 30 <= ultimo['rsi'] <= 45 and ultimo['close'] > ultimo['ema_20'] and ultimo['atr_pct'] > 0.5:
-        precio = round(ultimo['close'], 2)
-        return {
-            'tipo': 'CALL',
-            'precio': precio,
-            'tp1': round(precio * 1.02, 2),
-            'tp2': round(precio * 1.04, 2),
-            'confianza': 'ALTA'
-        }
-    # Señal de VENTA
-    if 55 <= ultimo['rsi'] <= 70 and ultimo['close'] < ultimo['ema_20'] and ultimo['atr_pct'] > 0.5:
-        precio = round(ultimo['close'], 2)
-        return {
-            'tipo': 'PUT',
-            'precio': precio,
-            'tp1': round(precio * 0.98, 2),
-            'tp2': round(precio * 0.96, 2),
-            'confianza': 'ALTA'
-        }
-    return None
-
-def detectar_senal_binarias(df):
-    if df is None:
-        return None
-    ultimo = df.iloc[-1]
-    if 40 <= ultimo['rsi'] <= 60 and ultimo['close'] > ultimo['ema_20']:
-        return {
-            'tipo': 'CALL',
-            'precio': round(ultimo['close'], 2),
-            'duracion': '5-15 min'
-        }
-    if 40 <= ultimo['rsi'] <= 60 and ultimo['close'] < ultimo['ema_20']:
-        return {
-            'tipo': 'PUT',
-            'precio': round(ultimo['close'], 2),
-            'duracion': '5-15 min'
-        }
-    return None
-
-# ===================== FUNCIÓN PARA OBTENER DATOS =====================
-def obtener_datos_twelvedata(simbolo, intervalo="5min", outputsize=50):
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "apikey": TWELVEDATA_API_KEY,
-        "symbol": simbolo,
-        "interval": intervalo,
-        "outputsize": outputsize,
-        "format": "JSON"
-    }
+def obtener_datos_investing(simbolo, intervalo="5", outputsize=50):
+    """
+    Obtiene datos de Investing.com usando investiny.
+    Args:
+        simbolo: Símbolo del activo (ej. "XAUUSD", "WTI", "US100")
+        intervalo: Intervalo en minutos (1, 5, 15, 30, 60)
+        outputsize: Número de velas a obtener
+    """
     try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if "values" not in data:
+        # Primero, buscar el activo para obtener su investing_id
+        search_results = search_assets(query=simbolo, limit=1)
+        if not search_results:
+            print(f"Activo {simbolo} no encontrado")
             return None
-        df = pd.DataFrame(data["values"])
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df = df.sort_values("datetime")
-        df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
-        df.columns = [c.lower() for c in df.columns]
+        
+        investing_id = int(search_results[0]["ticker"])
+        
+        # Calcular fechas (últimos 'outputsize' intervalos)
+        from datetime import datetime, timedelta
+        end_date = datetime.now()
+        # Necesitamos calcular la fecha de inicio basada en el intervalo
+        # Esto es una simplificación; en producción ajusta según necesidad
+        start_date = end_date - timedelta(minutes=outputsize * int(intervalo))
+        
+        # Formatear fechas como "dd/mm/aaaa"
+        from_date = start_date.strftime("%d/%m/%Y")
+        to_date = end_date.strftime("%d/%m/%Y")
+        
+        # Obtener datos históricos
+        data = historical_data(
+            investing_id=investing_id,
+            from_date=from_date,
+            to_date=to_date
+        )
+        
+        if not data:
+            return None
+        
+        # Convertir a DataFrame
+        df = pd.DataFrame(data)
+        
+        # Renombrar columnas al formato esperado por calcular_indicadores
+        df = df.rename(columns={
+            'open': 'open',
+            'high': 'high',
+            'low': 'low',
+            'close': 'close',
+            'volume': 'volume'
+        })
+        
+        # Asegurar tipos numéricos
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Convertir índice datetime si existe
+        if 'date' in df.columns:
+            df['datetime'] = pd.to_datetime(df['date'])
+            df = df.set_index('datetime')
+        
         return df
+        
     except Exception as e:
-        print(f"Error con {simbolo}: {e}")
+        print(f"Error con investiny para {simbolo}: {e}")
         return None
 
-# ===================== FUNCIÓN AUXILIAR PARA TELEGRAM =====================
-async def enviar_telegram_coroutine(mensaje):
-    try:
-        bot = telegram.Bot(token=TELEGRAM_TOKEN)
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=mensaje, parse_mode='Markdown')
-    except Exception as e:
-        print(f"Error enviando Telegram: {e}")
-
-# ===================== ENDPOINTS DE LA API =====================
-@app.get("/")
-def home():
-    return {"mensaje": "API de Trading funcionando"}
-
-@app.get("/senal/{activo}")
-async def get_senal(activo: str):
-    """Devuelve la señal actual para un activo (ej. XAUUSD)"""
-    df = obtener_datos_twelvedata(activo)
-    if df is None:
-        return {"error": "No se pudieron obtener datos"}
-    df = calcular_indicadores(df)
-    senal_ap = detectar_senal_apalancamiento(df)
-    senal_bin = detectar_senal_binarias(df)
-    return {
-        "activo": activo,
-        "apalancamiento": senal_ap,
-        "binarias": senal_bin
-    }
-
-@app.get("/enviar-telegram")
-async def enviar_telegram(mensaje: str):
-    """Envía un mensaje de prueba a Telegram"""
-    try:
-        bot = telegram.Bot(token=TELEGRAM_TOKEN)
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=mensaje)
-        return {"ok": True}
-    except Exception as e:
-        return {"error": str(e)}
-
-# ===================== TAREA AUTOMÁTICA CADA 5 MINUTOS =====================
-def bucle_senales():
-    activos = ["XAUUSD", "WTI", "US100"]
-    while True:
-        for activo in activos:
-            try:
-                df = obtener_datos_twelvedata(activo)
-                if df is not None:
-                    df = calcular_indicadores(df)
-                    senal_ap = detectar_senal_apalancamiento(df)
-                    senal_bin = detectar_senal_binarias(df)
-                    if senal_ap or senal_bin:
-                        mensaje = f"🔔 *{activo}*\n"
-                        if senal_ap:
-                            mensaje += f"📈 Apalancamiento: {senal_ap['tipo']} a ${senal_ap['precio']} TP1: ${senal_ap['tp1']} TP2: ${senal_ap['tp2']}\n"
-                        if senal_bin:
-                            mensaje += f"⏱ Binarias: {senal_bin['tipo']} a ${senal_bin['precio']} (Duración: {senal_bin['duracion']})\n"
-                        # Ejecutar la corrutina de forma asíncrona en un bucle de eventos nuevo
-                        asyncio.run(enviar_telegram_coroutine(mensaje))
-            except Exception as e:
-                print(f"Error en {activo}: {e}")
-            time.sleep(2)  # Pequeña pausa entre activos
-        time.sleep(300)   # 5 minutos
-
-def iniciar_bucle():
-    thread = threading.Thread(target=bucle_senales, daemon=True)
-    thread.start()
-
-@app.on_event("startup")
-def startup_event():
-    iniciar_bucle()
+# Luego, en tu función get_senal y en el bucle, reemplaza obtener_datos_twelvedata por obtener_datos_investing
