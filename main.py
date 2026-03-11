@@ -1,4 +1,5 @@
 from investiny import historical_data, search_assets
+from datetime import datetime, timedelta
 
 def obtener_datos_investing(simbolo, intervalo="5", outputsize=50):
     """
